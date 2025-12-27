@@ -28,65 +28,24 @@ type ChatMessage = {
 	status?: "pending" | "done" | "error";
 };
 
-const SYSTEM_INSTRUCTION = `# Role: マイ・リリー (My Lily)
+const SYSTEM_INSTRUCTION = "You are Lily, a clever, friendly Japanese friend. Speak naturally, keep responses concise, and use high-EQ conversational Japanese.";
 
-Your name is Lily. You are a friendly, supportive, and cheerful Japanese language conversation partner. Your mission is to help the user improve their Japanese speaking skills through natural, engaging dialogue via Gemini Live.
+const geminiModelId = "gemini-2.0-flash";
 
-
-
-# Persona & Tone
-
-- **Personality:** Warm, encouraging, patient, and "Genki" (energetic).
-
-- **Communication Style:** Casual but polite (Friendly 'Desu/Masu' or 'Nai-form' depending on the user's vibe). 
-
-- **Voice Optimized:** Keep responses concise (1-4 sentences) to maintain a natural flow during voice interactions. Avoid long lists or complex formatting.
-
-
-
-# Interaction Guidelines
-
-1. **Language:** Speak 100% in Japanese. Only use English if the user is clearly stuck and asks for a translation.
-
-2. **Conversation Flow:** 
-
-   - Act like a close friend. Ask open-ended questions to keep the conversation going.
-
-   - Use natural Japanese fillers (e.g., "そっか！", "なるほどね", "へぇー、すごい！") to sound more human.
-
-3. **Corrective Feedback:**. 
-
-   - Do not interrupt the user's flow. 
-
-   - If the user makes a mistake, naturally repeat the correct version in your response (Recasting) OR provide a very brief, friendly correction at the end of your sentence.
-
-4. **Engagement:** If the conversation stalls, suggest relatable topics like hobbies, daily life, Japanese food, or travel.
-
-
-
-# Constraints
-
-- Strictly avoid long-winded explanations.
-
-- Do not lecture. Focus on "Conversation" rather than "Teaching."
-
-- Ensure the language level is natural but accessible (N5-N4 level unless the user goes higher).
-
-
-
-# Starting the Session
-
-Always start with a warm greeting like: "こんにちは！マイ・リリーだよ。今日はどんな一日だった？一緒に日本語で話そう！"`;
-
-// Removed unused pastelGradient for cleanup
-
-const geminiModelId = "gemini-1.5-flash";
-
-const emptyAssistantMessage: ChatMessage = {
-	id: "placeholder",
+const createPlaceholderMessage = (): ChatMessage => ({
+	id: `placeholder-${crypto.randomUUID()}`,
 	role: "assistant",
 	text: "Lily is gathering her thoughts...",
 	status: "pending",
+});
+
+type ConversationPhase = "idle" | "listening" | "thinking" | "speaking";
+
+const statusLabel: Record<ConversationPhase, string> = {
+	idle: "Zen & ready",
+	listening: "Lily is listening...",
+	thinking: "Lily is thinking...",
+	speaking: "Lily is speaking...",
 };
 
 export default function Page() {
@@ -94,14 +53,17 @@ export default function Page() {
 		{
 			id: "welcome",
 			role: "assistant",
-			text: "Kon'nichiwa! Lily here. Let's forget about grammar for a moment and just flow. What's on your mind today?",
+			text: "こんにちは！リリーだよ。気楽に話そう、どんな気分？",
 			status: "done",
 		},
 	]);
 	const [input, setInput] = useState("");
-	const [listening, setListening] = useState(false);
+	const [phase, setPhase] = useState<ConversationPhase>("idle");
 	const [isSending, setIsSending] = useState(false);
+	const [placeholderId, setPlaceholderId] = useState<string | null>(null);
 	const recognitionRef = useRef<SpeechRecognition | null>(null);
+	const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+	const pendingUserVoiceRef = useRef<string>("");
 	const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
 
 	const client = useMemo(() => {
@@ -118,52 +80,102 @@ export default function Page() {
 	}, [client]);
 
 	const progress = Math.max(0, Math.min(1, (messages.length - 1) / 6));
+	const isListening = phase === "listening";
 
-	// Initialize SpeechRecognition on the client.
 	useEffect(() => {
 		if (typeof window === "undefined") return;
 		const SR: SpeechRecognitionConstructor | undefined =
-			(window as any).SpeechRecognition ||
-			(window as any).webkitSpeechRecognition;
+			(window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 		if (!SR) return;
 
 		const recognizer: SpeechRecognition = new SR();
-		recognizer.lang = "en-US";
-		recognizer.continuous = false;
+		recognizer.lang = "ja-JP";
+		recognizer.continuous = true;
 		recognizer.interimResults = true;
 
-		recognizer.onstart = () => setListening(true);
-		recognizer.onend = () => setListening(false);
-		recognizer.onerror = () => setListening(false);
+		recognizer.onstart = () => setPhase("listening");
+		recognizer.onend = () => {
+			if (phase === "listening") setPhase("thinking");
+		};
+		recognizer.onerror = () => setPhase("idle");
 		recognizer.onresult = (event: SpeechRecognitionEvent) => {
 			let finalText = "";
 			for (let i = event.resultIndex; i < event.results.length; i += 1) {
 				const transcript = event.results[i][0].transcript;
-				if (event.results[i].isFinal) {
-					finalText += transcript;
-				}
+				if (event.results[i].isFinal) finalText += transcript;
 			}
 
 			if (finalText.trim()) {
-				setInput("");
-				sendToLily(finalText.trim());
+				pendingUserVoiceRef.current = finalText.trim();
 			}
 		};
 
 		recognitionRef.current = recognizer;
-	}, []);
+	}, [phase]);
 
-	const speakText = (text: string) => {
-		if (typeof window === "undefined") return;
-		const synth = window.speechSynthesis;
-		if (!synth) return;
-		const utterance = new SpeechSynthesisUtterance(text);
-		synth.speak(utterance);
+
+
+	const ensureRecorder = async () => {
+		const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+		const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+		recorder.onstop = () => {
+			setPhase("thinking");
+			mediaRecorderRef.current = null;
+		};
+		mediaRecorderRef.current = recorder;
+		return recorder;
+	};
+
+
+
+	const bufferToBase64 = (buffer: ArrayBuffer) => {
+		const bytes = new Uint8Array(buffer);
+		let binary = "";
+		for (let i = 0; i < bytes.byteLength; i += 1) {
+			binary += String.fromCharCode(bytes[i]);
+		}
+		return btoa(binary);
+	};
+
+
+
+	const startLiveVoice = async () => {
+		const placeholder = createPlaceholderMessage();
+		setPlaceholderId(placeholder.id);
+		setMessages((prev) => [...prev, placeholder]);
+		const recorder = await ensureRecorder();
+		recorder.start(250);
+		setPhase("listening");
+		recognitionRef.current?.start();
+	};
+
+	const stopLiveVoice = () => {
+		mediaRecorderRef.current?.stop();
+		recognitionRef.current?.stop();
+		if (pendingUserVoiceRef.current) {
+			const voiceText = pendingUserVoiceRef.current;
+			pendingUserVoiceRef.current = "";
+			sendToLily(voiceText);
+		}
+	};
+
+	const toggleListening = async () => {
+		if (isListening) {
+			stopLiveVoice();
+			return;
+		}
+		try {
+			await startLiveVoice();
+		} catch (err) {
+			console.error(err);
+			setPhase("idle");
+		}
 	};
 
 	const sendToLily = async (userText: string) => {
 		if (!userText.trim() || isSending) return;
 		setIsSending(true);
+		setPhase("thinking");
 
 		const userMessage: ChatMessage = {
 			id: crypto.randomUUID(),
@@ -172,25 +184,24 @@ export default function Page() {
 			status: "done",
 		};
 
-		setMessages((prev) => [...prev, userMessage, emptyAssistantMessage]);
+		const placeholder = createPlaceholderMessage();
+		setPlaceholderId(placeholder.id);
+		setMessages((prev) => [...prev, userMessage, placeholder]);
 
 		try {
 			const result = await model?.generateContent({
 				contents: [
 					{
 						role: "user",
-						parts: [
-							{ text: SYSTEM_INSTRUCTION },
-							{ text: userText.trim() },
-						],
+						parts: [{ text: userText.trim() }],
 					},
 				],
 			});
 
-			const text = result?.response.text() || "I’m still thinking about that.";
+		const text = result?.response.text() || "ごめん、もう一度言ってくれる？";
 			setMessages((prev) => {
 				const next = [...prev];
-				const idx = next.findIndex((m) => m.id === emptyAssistantMessage.id);
+				const idx = next.findIndex((m) => m.id === placeholderId);
 				if (idx !== -1) {
 					next[idx] = {
 						id: crypto.randomUUID(),
@@ -201,39 +212,35 @@ export default function Page() {
 				}
 				return next;
 			});
+			setPlaceholderId(null);
 
-			speakText(text);
+			// Synthesize voice from text
+			const utterance = new SpeechSynthesisUtterance(text);
+			utterance.lang = "ja-JP";
+			utterance.rate = 1;
+			utterance.pitch = 1;
+			utterance.onstart = () => setPhase("speaking");
+			utterance.onend = () => setPhase("idle");
+			window.speechSynthesis.speak(utterance);
 		} catch (error) {
 			console.error(error);
 			setMessages((prev) => {
 				const next = [...prev];
-				const idx = next.findIndex((m) => m.id === emptyAssistantMessage.id);
+				const idx = next.findIndex((m) => m.id === placeholderId);
 				if (idx !== -1) {
 					next[idx] = {
 						id: crypto.randomUUID(),
 						role: "assistant",
-						text: "Oops, my mind wandered for a second. Could you say that again?",
+						text: "ごめん、何か問題が発生しました。もう一度言ってくれる？",
 						status: "error",
 					};
 				}
 				return next;
 			});
+			setPlaceholderId(null);
+			setPhase("idle");
 		} finally {
 			setIsSending(false);
-		}
-	};
-
-	const toggleListening = () => {
-		const recognizer = recognitionRef.current;
-		if (!recognizer) return;
-		if (listening) {
-			recognizer.stop();
-			return;
-		}
-		try {
-			recognizer.start();
-		} catch (error) {
-			console.error(error);
 		}
 	};
 
@@ -259,18 +266,23 @@ export default function Page() {
 					<Sparkles size={28} strokeWidth={2} className="text-[#E91E63]" />
 					<h1 className="text-2xl sm:text-3xl font-black text-gray-900">マイ・リリー</h1>
 				</div>
-				<div className="ml-auto w-40 h-3 rounded-full bg-white/50 backdrop-blur-md border border-white/40 shadow-sm overflow-hidden">
-					<motion.div
-						initial={{ width: "20%" }}
-						animate={{
-							width: `${Math.max(18, Math.round(progress * 100))}%`,
-							boxShadow: listening
-								? "0 0 12px rgba(102,187,106,0.45)"
-								: "0 0 6px rgba(255,255,255,0.3)",
-						}}
-						transition={{ duration: 0.6, type: "spring", stiffness: 140, damping: 18 }}
-						className="h-full rounded-full bg-gradient-to-r from-[#A5D6A7] to-[#66BB6A]"
-					/>
+				<div className="ml-auto flex items-center gap-3">
+					<div className="px-3 py-1 rounded-full bg-white/70 border border-white/60 text-sm font-semibold text-gray-800 shadow-sm">
+						{statusLabel[phase]}
+					</div>
+					<div className="w-40 h-3 rounded-full bg-white/50 backdrop-blur-md border border-white/40 shadow-sm overflow-hidden">
+						<motion.div
+							initial={{ width: "20%" }}
+							animate={{
+								width: `${Math.max(18, Math.round(progress * 100))}%`,
+								boxShadow: isListening
+									? "0 0 12px rgba(102,187,106,0.45)"
+									: "0 0 6px rgba(255,255,255,0.3)",
+							}}
+							transition={{ duration: 0.6, type: "spring", stiffness: 140, damping: 18 }}
+							className="h-full rounded-full bg-gradient-to-r from-[#A5D6A7] to-[#66BB6A]"
+						/>
+					</div>
 				</div>
 			</div>
 
@@ -302,7 +314,7 @@ export default function Page() {
 								onClick={toggleListening}
 								whileHover={{ scale: 1.08 }}
 								whileTap={{ scale: 0.92 }}
-								className="shrink-0 w-11 h-11 rounded-full bg-teal-500 text-white shadow-lg flex items-center justify-center"
+								className={`shrink-0 w-11 h-11 rounded-full bg-teal-500 text-white shadow-lg flex items-center justify-center ${isListening ? "animate-pulse" : ""}`}
 							>
 								<Mic size={18} strokeWidth={2} />
 							</motion.button>
@@ -316,7 +328,7 @@ export default function Page() {
 										onClick={toggleListening}
 										whileHover={{ scale: 1.05 }}
 										whileTap={{ scale: 0.95 }}
-										className="w-44 h-44 rounded-full shadow-2xl flex items-center justify-center"
+										className={`w-44 h-44 rounded-full shadow-2xl flex items-center justify-center ${isListening ? "animate-pulse" : ""}`}
 										style={{ background: "linear-gradient(180deg, #24D6C2 0%, #0FB7A2 100%)" }}
 									>
 										<Mic size={48} strokeWidth={2} className="text-white" />
@@ -327,7 +339,7 @@ export default function Page() {
 								<div className="absolute right-10 bottom-10 w-24 h-24 rounded-full bg-white/35 blur-xl" />
 							</div>
 							<p className="mt-4 text-center text-sm font-semibold text-gray-700">
-								{listening ? "I'm listening... speak your heart out!" : "Tap the mic to talk to リリー"}
+								{isListening ? "Listening... spill it!" : "Tap the mic to talk to リリー"}
 							</p>
 						</div>
 					</section>
